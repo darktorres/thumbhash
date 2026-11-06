@@ -7,17 +7,94 @@ use std::io::Read;
 /// * `h`: The height of the input image. Must be ≤100px.
 /// * `rgba`: The pixels in the input image, row-by-row. Must have `w*h*4` elements.
 pub fn rgba_to_thumb_hash(w: usize, h: usize, rgba: &[u8]) -> Vec<u8> {
-    // Encoding an image larger than 100x100 is slow with no benefit
-    assert!(w <= 100 && h <= 100);
-    assert_eq!(rgba.len(), w * h * 4);
+    Encoder::default().rgba_to_thumb_hash(w, h, rgba)
+}
 
+// photo-gallery: the longest hash, for encoding into an array (`Encoder::rgb_to_thumb_hash_into`): a 6-byte header
+// (an image with alpha) and 38 AC nibbles in 19 bytes (luminance and alpha at most 5x5, 14 terms each; the two
+// colour differences 3x3, 5 each). Opaque, it is at most 24 (luminance 7x7, 27 terms).
+/// The longest ThumbHash, in bytes.
+pub const MAX_LEN: usize = 25;
+
+// photo-gallery: the encoder's buffers, kept across calls. Encoding allocates only the hash, or nothing when it is
+// written into an array.
+/// Encodes images to ThumbHashes, keeping its buffers (four planes of at most 100x100 values)
+/// from one image to the next.
+#[derive(Debug, Default)]
+pub struct Encoder {
+    l: Vec<f32>,
+    p: Vec<f32>,
+    q: Vec<f32>,
+    a: Vec<f32>,
+}
+
+impl Encoder {
+    /// [`rgba_to_thumb_hash`], with this encoder's buffers.
+    pub fn rgba_to_thumb_hash(&mut self, w: usize, h: usize, rgba: &[u8]) -> Vec<u8> {
+        let mut hash = [0; MAX_LEN];
+        let len = self.encode::<4>(w, h, rgba, &mut hash);
+        hash[..len].to_vec()
+    }
+
+    /// Encodes an RGB image (opaque) to a ThumbHash: the hash of the same image as RGBA with
+    /// every alpha 255, bit for bit.
+    ///
+    /// * `w`: The width of the input image. Must be ≤100px.
+    /// * `h`: The height of the input image. Must be ≤100px.
+    /// * `rgb`: The pixels in the input image, row-by-row. Must have `w*h*3` elements.
+    pub fn rgb_to_thumb_hash(&mut self, w: usize, h: usize, rgb: &[u8]) -> Vec<u8> {
+        let mut hash = [0; MAX_LEN];
+        let len = self.rgb_to_thumb_hash_into(w, h, rgb, &mut hash);
+        hash[..len].to_vec()
+    }
+
+    // photo-gallery: into an array, without allocating.
+    /// [`Self::rgb_to_thumb_hash`] written into `hash`; returns its length.
+    pub fn rgb_to_thumb_hash_into(
+        &mut self,
+        w: usize,
+        h: usize,
+        rgb: &[u8],
+        hash: &mut [u8; MAX_LEN],
+    ) -> usize {
+        self.encode::<3>(w, h, rgb, hash)
+    }
+
+    /// `N` is 4 (RGBA) or 3 (RGB, every alpha 1.0, as `255 as f32 / 255.0` is).
+    fn encode<const N: usize>(
+        &mut self,
+        w: usize,
+        h: usize,
+        pixels: &[u8],
+        hash: &mut [u8; MAX_LEN],
+    ) -> usize {
+        // Encoding an image larger than 100x100 is slow with no benefit
+        assert!(w <= 100 && h <= 100);
+        assert_eq!(pixels.len(), w * h * N);
+        let alpha_of = |px: &[u8]| if N == 4 { px[3] as f32 / 255.0 } else { 1.0 };
+        encode(w, h, pixels.chunks_exact(N), alpha_of, self, hash)
+    }
+}
+
+/// Max AC terms of a channel: `nx` and `ny` are at most 7.
+const MAX_AC: usize = 49;
+
+fn encode<'a>(
+    w: usize,
+    h: usize,
+    pixels: std::slice::ChunksExact<'a, u8>,
+    alpha_of: impl Fn(&[u8]) -> f32,
+    planes: &mut Encoder,
+    // photo-gallery: written here (upstream: a `Vec` returned).
+    out: &mut [u8; MAX_LEN],
+) -> usize {
     // Determine the average color
     let mut avg_r = 0.0;
     let mut avg_g = 0.0;
     let mut avg_b = 0.0;
     let mut avg_a = 0.0;
-    for rgba in rgba.chunks_exact(4) {
-        let alpha = rgba[3] as f32 / 255.0;
+    for rgba in pixels.clone() {
+        let alpha = alpha_of(rgba);
         avg_r += alpha / 255.0 * rgba[0] as f32;
         avg_g += alpha / 255.0 * rgba[1] as f32;
         avg_b += alpha / 255.0 * rgba[2] as f32;
@@ -33,14 +110,19 @@ pub fn rgba_to_thumb_hash(w: usize, h: usize, rgba: &[u8]) -> Vec<u8> {
     let l_limit = if has_alpha { 5 } else { 7 }; // Use fewer luminance bits if there's alpha
     let lx = (((l_limit * w) as f32 / w.max(h) as f32).round() as usize).max(1);
     let ly = (((l_limit * h) as f32 / w.max(h) as f32).round() as usize).max(1);
-    let mut l = Vec::with_capacity(w * h); // luminance
-    let mut p = Vec::with_capacity(w * h); // yellow - blue
-    let mut q = Vec::with_capacity(w * h); // red - green
-    let mut a = Vec::with_capacity(w * h); // alpha
+    let Encoder { l, p, q, a } = planes;
+    l.clear(); // luminance
+    p.clear(); // yellow - blue
+    q.clear(); // red - green
+    a.clear(); // alpha
+    // photo-gallery: each plane sized once, not grown by `push` (13 steps to a 100 × 100 image the first time).
+    for plane in [&mut *l, &mut *p, &mut *q, &mut *a] {
+        plane.reserve(w * h);
+    }
 
     // Convert the image from RGBA to LPQA (composite atop the average color)
-    for rgba in rgba.chunks_exact(4) {
-        let alpha = rgba[3] as f32 / 255.0;
+    for rgba in pixels {
+        let alpha = alpha_of(rgba);
         let r = avg_r * (1.0 - alpha) + alpha / 255.0 * rgba[0] as f32;
         let g = avg_g * (1.0 - alpha) + alpha / 255.0 * rgba[1] as f32;
         let b = avg_b * (1.0 - alpha) + alpha / 255.0 * rgba[2] as f32;
@@ -51,11 +133,11 @@ pub fn rgba_to_thumb_hash(w: usize, h: usize, rgba: &[u8]) -> Vec<u8> {
     }
 
     // Encode using the DCT into DC (constant) and normalized AC (varying) terms
-    let encode_channel = |channel: &[f32], nx: usize, ny: usize| -> (f32, Vec<f32>, f32) {
+    let encode_channel = |channel: &[f32], nx: usize, ny: usize| -> (f32, Ac, f32) {
         let mut dc = 0.0;
-        let mut ac = Vec::with_capacity(nx * ny / 2);
+        let mut ac = Ac::default();
         let mut scale = 0.0;
-        let mut fx = [0.0].repeat(w);
+        let mut fx = [0.0; 100];
         for cy in 0..ny {
             let mut cx = 0;
             while cx * ny < nx * (ny - cy) {
@@ -80,19 +162,19 @@ pub fn rgba_to_thumb_hash(w: usize, h: usize, rgba: &[u8]) -> Vec<u8> {
             }
         }
         if scale > 0.0 {
-            for ac in &mut ac {
+            for ac in ac.values_mut() {
                 *ac = 0.5 + 0.5 / scale * *ac;
             }
         }
         (dc, ac, scale)
     };
-    let (l_dc, l_ac, l_scale) = encode_channel(&l, lx.max(3), ly.max(3));
-    let (p_dc, p_ac, p_scale) = encode_channel(&p, 3, 3);
-    let (q_dc, q_ac, q_scale) = encode_channel(&q, 3, 3);
+    let (l_dc, l_ac, l_scale) = encode_channel(l, lx.max(3), ly.max(3));
+    let (p_dc, p_ac, p_scale) = encode_channel(p, 3, 3);
+    let (q_dc, q_ac, q_scale) = encode_channel(q, 3, 3);
     let (a_dc, a_ac, a_scale) = if has_alpha {
-        encode_channel(&a, 5, 5)
+        encode_channel(a, 5, 5)
     } else {
-        (1.0, Vec::new(), 1.0)
+        (1.0, Ac::default(), 1.0)
     };
 
     // Write the constants
@@ -106,7 +188,7 @@ pub fn rgba_to_thumb_hash(w: usize, h: usize, rgba: &[u8]) -> Vec<u8> {
         | (((63.0 * p_scale).round() as u16) << 3)
         | (((63.0 * q_scale).round() as u16) << 9)
         | if is_landscape { 1 << 15 } else { 0 };
-    let mut hash = Vec::with_capacity(25);
+    let mut hash = Hash { bytes: out, len: 0 };
     hash.extend_from_slice(&[
         (header24 & 255) as u8,
         ((header24 >> 8) & 255) as u8,
@@ -121,7 +203,7 @@ pub fn rgba_to_thumb_hash(w: usize, h: usize, rgba: &[u8]) -> Vec<u8> {
 
     // Write the varying factors
     for ac in [l_ac, p_ac, q_ac] {
-        for f in ac {
+        for &f in ac.values() {
             let u = (15.0 * f).round() as u8;
             if is_odd {
                 *hash.last_mut().unwrap() |= u << 4;
@@ -132,7 +214,7 @@ pub fn rgba_to_thumb_hash(w: usize, h: usize, rgba: &[u8]) -> Vec<u8> {
         }
     }
     if has_alpha {
-        for f in a_ac {
+        for &f in a_ac.values() {
             let u = (15.0 * f).round() as u8;
             if is_odd {
                 *hash.last_mut().unwrap() |= u << 4;
@@ -142,7 +224,66 @@ pub fn rgba_to_thumb_hash(w: usize, h: usize, rgba: &[u8]) -> Vec<u8> {
             is_odd = !is_odd;
         }
     }
-    hash
+    hash.len
+}
+
+// photo-gallery: the hash as it is written, in the caller's array (upstream: a `Vec`).
+struct Hash<'a> {
+    bytes: &'a mut [u8; MAX_LEN],
+    len: usize,
+}
+
+impl Hash<'_> {
+    fn push(&mut self, byte: u8) {
+        self.bytes[self.len] = byte;
+        self.len += 1;
+    }
+
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.push(b);
+        }
+    }
+
+    fn last_mut(&mut self) -> Option<&mut u8> {
+        self.len.checked_sub(1).map(|i| &mut self.bytes[i])
+    }
+}
+
+// photo-gallery: a channel's AC terms, on the stack.
+#[derive(Clone, Copy)]
+struct Ac {
+    values: [f32; MAX_AC],
+    len: usize,
+}
+
+impl Default for Ac {
+    fn default() -> Self {
+        Self { values: [0.0; MAX_AC], len: 0 }
+    }
+}
+
+impl Ac {
+    fn push(&mut self, v: f32) {
+        self.values[self.len] = v;
+        self.len += 1;
+    }
+
+    fn values(&self) -> &[f32] {
+        &self.values[..self.len]
+    }
+
+    fn values_mut(&mut self) -> &mut [f32] {
+        &mut self.values[..self.len]
+    }
+}
+
+impl std::ops::Index<usize> for Ac {
+    type Output = f32;
+
+    fn index(&self, i: usize) -> &f32 {
+        &self.values()[i]
+    }
 }
 
 fn read_byte(bytes: &mut &[u8]) -> Result<u8, ()> {
@@ -184,8 +325,8 @@ pub fn thumb_hash_to_rgba(mut hash: &[u8]) -> Result<(usize, usize, Vec<u8>), ()
 
     // Read the varying factors (boost saturation by 1.25x to compensate for quantization)
     let mut prev_bits = None;
-    let mut decode_channel = |nx: usize, ny: usize, scale: f32| -> Result<Vec<f32>, ()> {
-        let mut ac = Vec::with_capacity(nx * ny);
+    let mut decode_channel = |nx: usize, ny: usize, scale: f32| -> Result<Ac, ()> {
+        let mut ac = Ac::default();
         for cy in 0..ny {
             let mut cx = if cy > 0 { 0 } else { 1 };
             while cx * ny < nx * (ny - cy) {
@@ -209,7 +350,7 @@ pub fn thumb_hash_to_rgba(mut hash: &[u8]) -> Result<(usize, usize, Vec<u8>), ()
     let a_ac = if has_alpha {
         decode_channel(5, 5, a_scale)?
     } else {
-        Vec::new()
+        Ac::default()
     };
 
     // Decode using the DCT into RGB
@@ -219,8 +360,8 @@ pub fn thumb_hash_to_rgba(mut hash: &[u8]) -> Result<(usize, usize, Vec<u8>), ()
         ((32.0 * ratio).round() as usize, 32)
     };
     let mut rgba = Vec::with_capacity(w * h * 4);
-    let mut fx = [0.0].repeat(7);
-    let mut fy = [0.0].repeat(7);
+    let mut fx = [0.0; 7];
+    let mut fy = [0.0; 7];
     for y in 0..h {
         for x in 0..w {
             let mut l = l_dc;
@@ -329,4 +470,24 @@ pub fn thumb_hash_to_approximate_aspect_ratio(hash: &[u8]) -> Result<f32, ()> {
     let lx = if is_landscape { l_max } else { l_min };
     let ly = if is_landscape { l_min } else { l_max };
     Ok(lx as f32 / ly as f32)
+}
+
+// photo-gallery: the RGB entry point and a reused encoder give upstream's hashes.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rgb_and_a_reused_encoder_hash_as_rgba() {
+        let mut encoder = Encoder::default();
+        for (w, h) in [(1, 1), (100, 1), (37, 100), (100, 100), (64, 48)] {
+            let rgb: Vec<u8> = (0..w * h * 3).map(|i| (i * 7 + i / 5) as u8).collect();
+            let rgba: Vec<u8> = rgb.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect();
+            let want = rgba_to_thumb_hash(w, h, &rgba);
+            assert_eq!(encoder.rgb_to_thumb_hash(w, h, &rgb), want);
+            assert_eq!(encoder.rgba_to_thumb_hash(w, h, &rgba), want);
+            let (tw, th, pixels) = thumb_hash_to_rgba(&want).unwrap();
+            assert_eq!(pixels.len(), tw * th * 4);
+        }
+    }
 }
